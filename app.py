@@ -6,14 +6,47 @@ C1-C14, running against the full-resolution Sigma historian export instead of
 a downsampled, pre-recalculated workbook.
 """
 import datetime as dt
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from docx import Document
+from docx.shared import Pt, RGBColor
 
 from calc_engine import METRICS, METRIC_BY_KEY, load_equipment_config, compute_compressor, apply_flags
 from data_prep import build_raw_csv
+
+METRIC_NOTES = {
+    "suct_press": "Live suct_press compared to the compressor's own live suct_press_sp (control setpoint tag). No nameplate data required.",
+    "disc_temp": "Isentropic compression-ratio ceiling: T2=(T1_K)×((P2+14.696)/(P1+14.696))^(0.3/1.3); k=1.3 for NH3. One-sided: live should stay below this ideal. 10°F Warning threshold is a working estimate calibrated on one day of Comp5 data — flagged as not yet fully validated.",
+    "tr_fl": "SOO PDF Sec 3.4/3.5 polynomial, coefficients from Equipment_Config (correct Table 1-5 per compressor). SCT input uses live Discharge Temp in place of a derived-from-pressure estimate (validated within ~1-2% on Comp1). Flag divides by the LIVE reading (shows N/A when the compressor is idle, live=0) — this matches the original workbook's own logic, not a bug.",
+    "tr_pl": "TR_FL(calc) × Slide Valve % / 100. Same live-denominator flag logic as TR_FL.",
+    "kw_per_ton": "Measured Motor kW / TR_PL(calc). Same live-denominator flag logic as TR_FL/TR_PL.",
+    "slide_vlv": "Physical range sanity check only: valid = 0-100%.",
+    "suct_temp": "Live suct_temp vs the compressor's own documented Design SST (Equipment_Config). Compressor 8 has no documented Design SST and will show N/A.",
+    "disc_press": "Live disc_press vs the pressure equivalent of the design condensing temp (95°F for all 14 units), via (Design_SCT-19.5)/0.575.",
+    "motor_kw": "Live motor_kw vs nameplate-rated motor kW (Motor HP × 0.7457). One-sided ceiling check — margin = Rated − Live.",
+    "kwh": "Re-integrated cumulative energy (Σ Motor kW × elapsed hours), anchored to the PLC's own first reading in the dataset, self-compared against the PLC's own running kWh meter.",
+    "motor_kw_sv": "Working proportional estimate (no manual-sourced formula exists): Expected kW = Nameplate Rated kW × (Slide Valve % / 100). Treat as directional.",
+}
+
+KNOWN_QUIRK_TEXT = (
+    "In the original workbook, three metrics — TR_FL, TR_PL, and kW/Ton — compare Live against "
+    "Expected using Live as the denominator (not Expected), and show \"N/A\" whenever the compressor "
+    "is idle (Live = 0) rather than flagging a huge, meaningless deviation. Every other "
+    "percent-deviation metric divides by Expected instead. This is reproduced exactly here, matching "
+    "the original Excel tool's own behavior — not a bug."
+)
+KNOWN_DATA_QUALITY_TEXT = (
+    "The source historian export has duplicate-timestamp buckets (two real samples sharing one "
+    "rounded label) — not deduplicated here, same as the original workbook. Suction Pressure "
+    "Setpoint occasionally reports a physically impossible ~-14.7 placeholder value; this is not "
+    "filtered and will show as Invalid when it occurs. Compressors 8, 10, and 14 read as idle for "
+    "the exported week in the original validation pass — don't assume 0 kW / Normal flags mean a "
+    "unit is actually running without checking."
+)
 
 st.set_page_config(page_title="Altus Compressor Validation Tool", layout="wide")
 
@@ -47,6 +80,83 @@ def _compute(comp: int, tol_overrides_key: tuple):
 
 def fmt_pct(x):
     return f"{x * 100:.1f}%"
+
+
+def build_word_report(comp, metric_key, metric_label, unit, ttype, period_start, period_end,
+                       valid_pct_t1, valid_pct_t2, missing_pct, total_in_period,
+                       count_normal, count_warning, count_invalid, count_na, suggestion,
+                       tol_applicable, tol1_eff, tol2_eff):
+    """Builds a .docx validation summary for one compressor/metric/period, returned
+    as bytes ready for st.download_button. Text-only (no embedded chart image) —
+    keeps this dependency-light (python-docx has no native binaries to get blocked
+    by a locked-down corporate PC, unlike the pyarrow issue we hit earlier)."""
+    doc = Document()
+
+    title = doc.add_heading("Altus Compressor Validation Tool — Validation Report", level=1)
+
+    meta = doc.add_paragraph()
+    meta.add_run(f"Compressor {comp}").bold = True
+    meta.add_run(f"  |  Metric: {metric_label}  |  Period: "
+                 f"{period_start:%m/%d/%Y %H:%M} – {period_end:%m/%d/%Y %H:%M}")
+    gen = doc.add_paragraph()
+    gen.add_run(f"Generated {dt.datetime.now():%m/%d/%Y %H:%M}").italic = True
+
+    doc.add_heading("Data Validation Summary", level=2)
+    summary_table = doc.add_table(rows=5, cols=2)
+    summary_table.style = "Light Grid Accent 1"
+    rows = [
+        ("Valid % — Tolerance 1 (tight)", fmt_pct(valid_pct_t1)),
+        ("Valid % — Tolerance 2 (incl. warning)", fmt_pct(valid_pct_t2)),
+        ("Missing Data %", fmt_pct(missing_pct)),
+        ("Readings in period", f"{total_in_period:,}"),
+        ("Tolerances used", f"T1: {tol1_eff*100:.0f}%  T2: {tol2_eff*100:.0f}%" if tol_applicable else "N/A for this metric"),
+    ]
+    for i, (k, v) in enumerate(rows):
+        summary_table.cell(i, 0).text = k
+        summary_table.cell(i, 1).text = v
+
+    doc.add_paragraph()
+    sugg = doc.add_paragraph()
+    sugg.add_run("Suggestion: ").bold = True
+    sugg.add_run(suggestion)
+
+    doc.add_heading("Flag Counts", level=2)
+    flag_table = doc.add_table(rows=1, cols=4)
+    flag_table.style = "Light Grid Accent 1"
+    hdr = flag_table.rows[0].cells
+    for i, label in enumerate(["Normal", "Warning", "Invalid", "N/A"]):
+        hdr[i].text = label
+    row = flag_table.add_row().cells
+    colors = [RGBColor(0x2f, 0x7a, 0x4f), RGBColor(0xb4, 0x79, 0x0f), RGBColor(0xb2, 0x3b, 0x2e), RGBColor(0x80, 0x86, 0x7f)]
+    for i, val in enumerate([count_normal, count_warning, count_invalid, count_na]):
+        cell = row[i]
+        cell.text = f"{val:,}"
+        for p in cell.paragraphs:
+            for r in p.runs:
+                r.font.color.rgb = colors[i]
+                r.font.bold = True
+
+    doc.add_heading("Formula / Source Notes", level=2)
+    doc.add_paragraph(METRIC_NOTES.get(metric_key, ""))
+    doc.add_paragraph(f"Comparison method: {ttype}")
+
+    doc.add_heading("Known Quirk Reproduced on Purpose", level=2)
+    doc.add_paragraph(KNOWN_QUIRK_TEXT)
+
+    doc.add_heading("Known Data-Quality Notes", level=2)
+    doc.add_paragraph(KNOWN_DATA_QUALITY_TEXT)
+
+    footer = doc.add_paragraph()
+    footer.add_run(
+        "This report was generated from the live historian data behind the Altus "
+        "Compressor Validation Tool dashboard. It reflects the data and tolerance "
+        "settings in effect at the time of generation."
+    ).italic = True
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -241,25 +351,61 @@ st.plotly_chart(fig, use_container_width=True)
 # Footer / notes
 # ---------------------------------------------------------------------------
 with st.expander("Formula / source notes for this metric"):
-    notes = {
-        "suct_press": "Live suct_press compared to the compressor's own live suct_press_sp (control setpoint tag). No nameplate data required.",
-        "disc_temp": "Isentropic compression-ratio ceiling: T2=(T1_K)×((P2+14.696)/(P1+14.696))^(0.3/1.3); k=1.3 for NH3. One-sided: live should stay below this ideal. 10°F Warning threshold is a working estimate calibrated on one day of Comp5 data — flagged as not yet fully validated.",
-        "tr_fl": "SOO PDF Sec 3.4/3.5 polynomial, coefficients from Equipment_Config (correct Table 1-5 per compressor). SCT input uses live Discharge Temp in place of a derived-from-pressure estimate (validated within ~1-2% on Comp1). Flag divides by the LIVE reading (shows N/A when the compressor is idle, live=0) — this matches the original workbook's own logic, not a bug.",
-        "tr_pl": "TR_FL(calc) × Slide Valve % / 100. Same live-denominator flag logic as TR_FL.",
-        "kw_per_ton": "Measured Motor kW / TR_PL(calc). Same live-denominator flag logic as TR_FL/TR_PL.",
-        "slide_vlv": "Physical range sanity check only: valid = 0-100%.",
-        "suct_temp": "Live suct_temp vs the compressor's own documented Design SST (Equipment_Config). Compressor 8 has no documented Design SST and will show N/A.",
-        "disc_press": "Live disc_press vs the pressure equivalent of the design condensing temp (95°F for all 14 units), via (Design_SCT-19.5)/0.575.",
-        "motor_kw": "Live motor_kw vs nameplate-rated motor kW (Motor HP × 0.7457). One-sided ceiling check — margin = Rated − Live.",
-        "kwh": "Re-integrated cumulative energy (Σ Motor kW × elapsed hours), anchored to the PLC's own first reading in the dataset, self-compared against the PLC's own running kWh meter.",
-        "motor_kw_sv": "Working proportional estimate (no manual-sourced formula exists): Expected kW = Nameplate Rated kW × (Slide Valve % / 100). Treat as directional.",
-    }
-    st.write(notes.get(metric_key, ""))
+    st.write(METRIC_NOTES.get(metric_key, ""))
     st.caption(f"Comparison method: {ttype}  |  Tolerance 1: {tol1_eff if tol_applicable else '—'}  Tolerance 2: {tol2_eff if tol_applicable else '—'}")
 
-st.caption(
-    "Known data-quality notes (apply to all compressors): the source historian export has duplicate-timestamp buckets "
-    "(two real samples sharing one rounded label) — not deduplicated here, same as the original workbook. "
-    "Suction Pressure Setpoint occasionally reports a physically impossible ~-14.7 placeholder value; this is not filtered "
-    "and will show as Invalid when it occurs."
-)
+st.caption("Known data-quality notes (apply to all compressors): " + KNOWN_DATA_QUALITY_TEXT)
+
+# ---------------------------------------------------------------------------
+# Exports — CSV tag-results sheet (all metrics, Calc_Engine style) and a
+# Word summary report, both scoped to the selected compressor and period.
+# ---------------------------------------------------------------------------
+st.subheader("Export")
+exp_col1, exp_col2 = st.columns(2)
+
+with exp_col1:
+    st.caption(
+        "Time-wise results for every tag/metric on this compressor, over the chosen "
+        "period — Live, Expected, and the Normal/Warning/Invalid/N/A flag side by "
+        "side for each, same layout as the Excel tool's Calc_Engine sheet."
+    )
+    export_cols = ["timestamp"]
+    col_rename = {"timestamp": "Timestamp"}
+    for m_key, m_label, m_ttype, m_unit, m_t1, m_t2, m_const, m_denom in METRICS:
+        live_c, exp_c, flag_c = f"{m_key}_live", f"{m_key}_expected", f"{m_key}_flag"
+        export_cols.append(live_c)
+        col_rename[live_c] = f"{m_label} ({m_unit}) — Live"
+        if m_ttype != "RangeCheck":
+            export_cols.append(exp_c)
+            col_rename[exp_c] = f"{m_label} ({m_unit}) — Expected"
+        export_cols.append(flag_c)
+        col_rename[flag_c] = f"{m_label} — Flag"
+    export_df = period[export_cols].rename(columns=col_rename)
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download tag results (CSV)",
+        data=csv_bytes,
+        file_name=f"Altus_Compressor{comp}_TagResults_{period_start:%Y%m%d}-{period_end:%Y%m%d}.csv",
+        mime="text/csv",
+    )
+
+with exp_col2:
+    st.caption(
+        "A Word document summarizing this view — compressor, metric, period, the "
+        "validation summary, the suggestion, and the formula/data-quality notes — "
+        "for sharing or filing without anyone needing to open the dashboard."
+    )
+    report_bytes = build_word_report(
+        comp=comp, metric_key=metric_key, metric_label=metric_label, unit=unit, ttype=ttype,
+        period_start=period_start, period_end=period_end,
+        valid_pct_t1=valid_pct_t1, valid_pct_t2=valid_pct_t2, missing_pct=missing_pct,
+        total_in_period=total_in_period, count_normal=count_normal, count_warning=count_warning,
+        count_invalid=count_invalid, count_na=count_na, suggestion=suggestion,
+        tol_applicable=tol_applicable, tol1_eff=tol1_eff, tol2_eff=tol2_eff,
+    )
+    st.download_button(
+        "⬇️ Download summary report (Word)",
+        data=report_bytes,
+        file_name=f"Altus_Compressor{comp}_{metric_key}_Report_{period_start:%Y%m%d}-{period_end:%Y%m%d}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
